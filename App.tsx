@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Linking,
@@ -10,6 +10,8 @@ import {
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import * as Sharing from 'expo-sharing';
+import { captureRef } from 'react-native-view-shot';
 import {
   useFonts,
   Inter_200ExtraLight,
@@ -22,6 +24,7 @@ import {
 import { Condition, WeatherSnapshot } from './src/weather';
 import { pickQuip } from './src/quips';
 import { useWeather } from './src/useWeather';
+import { NICE_NOPES } from './src/nope';
 
 const COLORS = {
   bg: '#000000',
@@ -57,6 +60,30 @@ function windLabel(w: WeatherSnapshot): string {
     return `💨 ${wind} mph · gusts ${gust}`;
   }
   return `💨 ${wind} mph wind`;
+}
+
+// The 69° easter egg. First it's just "Nice." Each extra pull-to-refresh escalates
+// the app's flat refusal to say anything else — the giant NICE_NOPES list (many
+// languages) lives in ./src/nope so we never run out of ways to say no.
+const NICE_SPICY = [
+  "It's nice as balls. Now piss off.",
+  "It's fucking nice. Quit poking me.",
+  'Nice. N-I-C-E. Learn to read.',
+];
+
+function niceQuip(streak: number): string {
+  switch (streak) {
+    case 1:
+      return 'Nice.';
+    case 2:
+      return 'I SAID NICE';
+    case 3:
+      return NICE_SPICY[Math.floor(Math.random() * NICE_SPICY.length)];
+    case 4:
+      return 'nah fam';
+    default:
+      return `Nice (${NICE_NOPES[Math.floor(Math.random() * NICE_NOPES.length)]})`;
+  }
 }
 
 function Chip({ label }: { label: string }) {
@@ -105,11 +132,39 @@ export default function App() {
 
   // A fresh quip per fetch; tapping the quip rerolls without refetching.
   const [quipSeed, setQuipSeed] = useState(0);
-  const quip = useMemo(
-    () => (data ? pickQuip(data) : ''),
+  const [quip, setQuip] = useState('');
+  // 69° is Nice. Keep pulling for another and it escalates: I SAID NICE ->
+  // spicy -> nah fam -> Nice (no/nope/no way jose...). Resets when temp leaves 69.
+  const niceStreak = useRef(0);
+  useEffect(() => {
+    if (!data) {
+      setQuip('');
+      return;
+    }
+    if (Math.round(data.tempF) === 69) {
+      niceStreak.current += 1;
+      setQuip(niceQuip(niceStreak.current));
+    } else {
+      niceStreak.current = 0;
+      setQuip(pickQuip(data));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [data?.fetchedAt, quipSeed]
-  );
+  }, [data?.fetchedAt, quipSeed]);
+
+  const shotRef = useRef<View>(null);
+  const handleShare = async () => {
+    try {
+      const uri = await captureRef(shotRef, { format: 'png', quality: 1 });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, {
+          mimeType: 'image/png',
+          dialogTitle: 'Share your Foulcast',
+        });
+      }
+    } catch {
+      // Sharing is best-effort; ignore cancellations and failures.
+    }
+  };
 
   if (!fontsLoaded) {
     return <View style={styles.root} />;
@@ -149,27 +204,41 @@ export default function App() {
   } else if (data) {
     content = (
       <View style={styles.center}>
-        {data.city ? (
-          <Text style={styles.city}>{data.city.toUpperCase()}</Text>
-        ) : null}
+        <View ref={shotRef} collapsable={false} style={styles.card}>
+          {data.city ? (
+            <Text style={styles.city}>{data.city.toUpperCase()}</Text>
+          ) : null}
 
-        <Text style={styles.temp}>{Math.round(data.tempF)}°</Text>
-        <Text style={styles.feels}>
-          feels like {Math.round(data.feelsLikeF)}°
-        </Text>
+          <Text style={styles.temp}>{Math.round(data.tempF)}°</Text>
+          <Text style={styles.feels}>
+            feels like {Math.round(data.feelsLikeF)}°
+          </Text>
 
-        <View style={styles.rule} />
+          <View style={styles.rule} />
 
-        <Pressable onPress={() => setQuipSeed((s) => s + 1)} hitSlop={16}>
-          <Text style={styles.quip}>{quip}</Text>
+          <Pressable onPress={() => setQuipSeed((s) => s + 1)} hitSlop={16}>
+            <Text style={styles.quip}>{quip}</Text>
+          </Pressable>
+
+          {(data.isPrecipitating || data.isWindy) && (
+            <View style={styles.chips}>
+              {data.isPrecipitating ? <Chip label={precipLabel(data)} /> : null}
+              {data.isWindy ? <Chip label={windLabel(data)} /> : null}
+            </View>
+          )}
+
+          <Text style={styles.wordmark}>FOULCAST</Text>
+        </View>
+
+        <Pressable
+          onPress={handleShare}
+          style={({ pressed }) => [
+            styles.shareBtn,
+            pressed && styles.buttonPressed,
+          ]}
+        >
+          <Text style={styles.shareBtnText}>Share</Text>
         </Pressable>
-
-        {(data.isPrecipitating || data.isWindy) && (
-          <View style={styles.chips}>
-            {data.isPrecipitating ? <Chip label={precipLabel(data)} /> : null}
-            {data.isWindy ? <Chip label={windLabel(data)} /> : null}
-          </View>
-        )}
 
         <Text style={styles.hint}>tap for another take · pull to refresh</Text>
       </View>
@@ -271,6 +340,34 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 34,
     letterSpacing: 0.5,
+  },
+  card: {
+    alignItems: 'center',
+    backgroundColor: COLORS.bg,
+    paddingHorizontal: 24,
+    paddingVertical: 28,
+  },
+  wordmark: {
+    fontFamily: 'Inter_600SemiBold',
+    color: COLORS.faint,
+    fontSize: 13,
+    letterSpacing: 4,
+    marginTop: 30,
+  },
+  shareBtn: {
+    borderWidth: 1,
+    borderColor: COLORS.chipBorder,
+    backgroundColor: COLORS.chipBg,
+    borderRadius: 999,
+    paddingHorizontal: 26,
+    paddingVertical: 11,
+    marginTop: 24,
+  },
+  shareBtnText: {
+    fontFamily: 'Inter_600SemiBold',
+    color: COLORS.text,
+    fontSize: 15,
+    letterSpacing: 0.3,
   },
   stateBig: {
     fontFamily: 'Inter_700Bold',
