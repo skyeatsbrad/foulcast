@@ -77,6 +77,42 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
+const wait = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Resolves with the first promise to fulfill; only rejects once every promise
+// has rejected. Lets us race weather providers so one dead host can't stall the
+// whole refresh — whoever answers first wins.
+function firstSuccess<T>(promises: Promise<T>[]): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let remaining = promises.length;
+    let done = false;
+    let lastErr: unknown = new Error('No providers to try.');
+    if (remaining === 0) {
+      reject(lastErr);
+      return;
+    }
+    for (const p of promises) {
+      p.then(
+        (value) => {
+          if (!done) {
+            done = true;
+            resolve(value);
+          }
+        },
+        (err) => {
+          lastErr = err;
+          remaining -= 1;
+          if (remaining === 0 && !done) {
+            done = true;
+            reject(lastErr);
+          }
+        }
+      );
+    }
+  });
+}
+
 async function getCoords(): Promise<{ latitude: number; longitude: number }> {
   const { status } = await Location.requestForegroundPermissionsAsync();
   if (status !== 'granted') {
@@ -128,7 +164,7 @@ type WeatherCore = Omit<WeatherSnapshot, 'city' | 'fetchedAt'>;
 
 const MS_TO_MPH = 2.2369362920544;
 // MET Norway rejects requests without an identifying User-Agent.
-const MET_USER_AGENT = 'Foulcast/1.1.3 (github.com/skyeatsbrad/foulcast)';
+const MET_USER_AGENT = 'Foulcast/1.1.4 (github.com/skyeatsbrad/foulcast)';
 
 async function fetchWithTimeout(
   url: string,
@@ -296,22 +332,27 @@ async function fetchFromMet(
 export async function fetchWeather(): Promise<WeatherSnapshot> {
   const { latitude, longitude } = await getCoords();
 
-  // Open-Meteo is primary (richer data). Retry once, then fall back to MET
-  // Norway so a flaky api.open-meteo.com can't take the whole app down.
+  // Race both providers instead of waiting out a dead host. Open-Meteo is
+  // primary (richer data), so it starts first and gets a short head start;
+  // MET Norway kicks off a beat later. Whoever answers first wins, and the
+  // outer timeout is a hard cap so a fetch that ignores its abort signal can
+  // never leave the refresh spinning. When api.open-meteo.com is down, MET
+  // resolves in ~1.5s instead of the app hanging on ~30s of timeouts.
+  const openMeteo = withTimeout(
+    fetchFromOpenMeteo(latitude, longitude),
+    10000,
+    'Open-Meteo timed out.'
+  );
+  const met = wait(600).then(() =>
+    withTimeout(fetchFromMet(latitude, longitude), 10000, 'MET timed out.')
+  );
+
   let core: WeatherCore | null = null;
-  for (let attempt = 0; attempt < 2 && !core; attempt += 1) {
-    try {
-      core = await fetchFromOpenMeteo(latitude, longitude);
-    } catch {
-      // try again / fall through to the backup
-    }
-  }
-  if (!core) {
-    try {
-      core = await fetchFromMet(latitude, longitude);
-    } catch {
-      // both providers down
-    }
+  try {
+    core = await firstSuccess<WeatherCore>([openMeteo, met]);
+  } catch {
+    // Both providers are down.
+    core = null;
   }
   if (!core) {
     throw new Error(
