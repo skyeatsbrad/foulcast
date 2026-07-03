@@ -59,18 +59,49 @@ export class LocationPermissionError extends Error {
   }
 }
 
+// Rejects if the promise doesn't settle in time, so a stuck GPS lock or a dead
+// network can never leave the app spinning on "Sniffing the air…" forever.
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 async function getCoords(): Promise<{ latitude: number; longitude: number }> {
   const { status } = await Location.requestForegroundPermissionsAsync();
   if (status !== 'granted') {
     throw new LocationPermissionError();
   }
-  // Last-known is instant; fall back to a fresh fix if there isn't one yet.
-  const last = await Location.getLastKnownPositionAsync();
-  const pos =
-    last ??
-    (await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.Balanced,
-    }));
+
+  // A cached fix is instant and sidesteps the slow (sometimes never-ending)
+  // fresh GPS lock, so use it whenever one exists.
+  const last = await Location.getLastKnownPositionAsync().catch(() => null);
+  if (last) {
+    return { latitude: last.coords.latitude, longitude: last.coords.longitude };
+  }
+
+  const enabled = await Location.hasServicesEnabledAsync().catch(() => true);
+  if (!enabled) {
+    throw new Error('Your location is switched off. Flip on GPS and try again.');
+  }
+
+  // Lowest accuracy uses wifi/cell instead of satellites — fast and works
+  // indoors. Race it so we bail with a clear message instead of hanging.
+  const pos = await withTimeout(
+    Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Lowest }),
+    15000,
+    "Couldn't pin down where you are. Get some open sky and try again."
+  );
   return { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
 }
 
@@ -79,7 +110,12 @@ async function reverseCity(
   longitude: number
 ): Promise<string | null> {
   try {
-    const results = await Location.reverseGeocodeAsync({ latitude, longitude });
+    // City is cosmetic — never let a slow geocoder block the forecast.
+    const results = await withTimeout(
+      Location.reverseGeocodeAsync({ latitude, longitude }),
+      6000,
+      'reverse-geocode timed out'
+    );
     const r = results?.[0];
     if (!r) return null;
     return r.city || r.subregion || r.region || r.district || null;
@@ -109,7 +145,18 @@ export async function fetchWeather(): Promise<WeatherSnapshot> {
     '&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch' +
     '&timezone=auto';
 
-  const res = await fetch(url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } catch {
+    throw new Error(
+      'Weather service ghosted us. Check your connection and try again.'
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!res.ok) {
     throw new Error(`Weather service coughed up a ${res.status}.`);
   }
