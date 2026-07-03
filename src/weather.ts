@@ -124,6 +124,26 @@ async function reverseCity(
   }
 }
 
+type WeatherCore = Omit<WeatherSnapshot, 'city' | 'fetchedAt'>;
+
+const MS_TO_MPH = 2.2369362920544;
+// MET Norway rejects requests without an identifying User-Agent.
+const MET_USER_AGENT = 'Foulcast/1.1.3 (github.com/skyeatsbrad/foulcast)';
+
+async function fetchWithTimeout(
+  url: string,
+  init: { headers?: Record<string, string> },
+  ms: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 interface OpenMeteoCurrent {
   temperature_2m: number;
   apparent_temperature: number;
@@ -135,9 +155,10 @@ interface OpenMeteoCurrent {
   is_day: number;
 }
 
-export async function fetchWeather(): Promise<WeatherSnapshot> {
-  const { latitude, longitude } = await getCoords();
-
+async function fetchFromOpenMeteo(
+  latitude: number,
+  longitude: number
+): Promise<WeatherCore> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}` +
     '&current=temperature_2m,apparent_temperature,relative_humidity_2m,' +
@@ -145,22 +166,10 @@ export async function fetchWeather(): Promise<WeatherSnapshot> {
     '&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch' +
     '&timezone=auto';
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  let res: Response;
-  try {
-    res = await fetch(url, { signal: controller.signal });
-  } catch {
-    throw new Error(
-      'Weather service ghosted us. Check your connection and try again.'
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
+  const res = await fetchWithTimeout(url, {}, 15000);
   if (!res.ok) {
     throw new Error(`Weather service coughed up a ${res.status}.`);
   }
-
   const json = (await res.json()) as { current?: OpenMeteoCurrent };
   const c = json.current;
   if (!c) {
@@ -172,26 +181,144 @@ export async function fetchWeather(): Promise<WeatherSnapshot> {
   const windMph = c.wind_speed_10m ?? 0;
   const windGustMph = c.wind_gusts_10m ?? 0;
 
-  const isPrecipitating =
-    precipInch > PRECIP_INCH_THRESHOLD || PRECIP_CONDITIONS.includes(condition);
-  const isWindy =
-    windMph >= WIND_MPH_THRESHOLD || windGustMph >= GUST_MPH_THRESHOLD;
-
-  const city = await reverseCity(latitude, longitude);
-
   return {
     tempF: c.temperature_2m,
     feelsLikeF: c.apparent_temperature,
     precipInch,
-    isPrecipitating,
+    isPrecipitating:
+      precipInch > PRECIP_INCH_THRESHOLD ||
+      PRECIP_CONDITIONS.includes(condition),
     windMph,
     windGustMph,
-    isWindy,
+    isWindy: windMph >= WIND_MPH_THRESHOLD || windGustMph >= GUST_MPH_THRESHOLD,
     humidity: c.relative_humidity_2m,
     isDay: c.is_day === 1,
     weatherCode: c.weather_code,
     condition,
-    city,
-    fetchedAt: Date.now(),
   };
+}
+
+// MET Norway symbol_code (e.g. "clearsky_night", "lightrain", "snow") -> Condition.
+function metSymbolToCondition(symbol: string): Condition {
+  const s = symbol.toLowerCase();
+  if (s.includes('thunder')) return 'thunderstorm';
+  if (s.includes('sleet')) return 'freezing';
+  if (s.includes('snow')) return 'snow';
+  if (s.includes('fog')) return 'fog';
+  if (s.includes('drizzle') || s.includes('lightrain')) return 'drizzle';
+  if (s.includes('rain')) return 'rain';
+  if (s.includes('cloud')) return 'cloudy';
+  if (s.includes('clearsky') || s.includes('fair')) return 'clear';
+  return 'cloudy';
+}
+
+interface MetInstantDetails {
+  air_temperature?: number;
+  wind_speed?: number;
+  wind_speed_of_gust?: number;
+  relative_humidity?: number;
+}
+interface MetTimeseries {
+  data?: {
+    instant?: { details?: MetInstantDetails };
+    next_1_hours?: {
+      summary?: { symbol_code?: string };
+      details?: { precipitation_amount?: number };
+    };
+    next_6_hours?: { summary?: { symbol_code?: string } };
+  };
+}
+
+// Fallback provider. Metric units (we convert); is_day from the symbol suffix
+// when present, otherwise a rough local-hour guess (good enough for a backup).
+async function fetchFromMet(
+  latitude: number,
+  longitude: number
+): Promise<WeatherCore> {
+  const url =
+    'https://api.met.no/weatherapi/locationforecast/2.0/compact' +
+    `?lat=${latitude.toFixed(4)}&lon=${longitude.toFixed(4)}`;
+  const res = await fetchWithTimeout(
+    url,
+    { headers: { 'User-Agent': MET_USER_AGENT } },
+    15000
+  );
+  if (!res.ok) {
+    throw new Error(`Backup weather service coughed up a ${res.status}.`);
+  }
+  const json = (await res.json()) as {
+    properties?: { timeseries?: MetTimeseries[] };
+  };
+  const ts = json.properties?.timeseries?.[0];
+  const inst = ts?.data?.instant?.details;
+  if (!inst || inst.air_temperature == null) {
+    throw new Error('Backup weather service sent back a whole lot of nothing.');
+  }
+
+  const symbol =
+    ts?.data?.next_1_hours?.summary?.symbol_code ??
+    ts?.data?.next_6_hours?.summary?.symbol_code ??
+    'cloudy';
+  const tempF = (inst.air_temperature * 9) / 5 + 32;
+  const windMph = (inst.wind_speed ?? 0) * MS_TO_MPH;
+  const windGustMph = (inst.wind_speed_of_gust ?? inst.wind_speed ?? 0) * MS_TO_MPH;
+  const precipInch =
+    (ts?.data?.next_1_hours?.details?.precipitation_amount ?? 0) / 25.4;
+  const condition = metSymbolToCondition(symbol);
+
+  let isDay: boolean;
+  if (symbol.endsWith('_day')) {
+    isDay = true;
+  } else if (symbol.endsWith('_night')) {
+    isDay = false;
+  } else {
+    const h = new Date().getHours();
+    isDay = h >= 7 && h < 20;
+  }
+
+  return {
+    tempF,
+    feelsLikeF: tempF,
+    precipInch,
+    isPrecipitating:
+      precipInch > PRECIP_INCH_THRESHOLD ||
+      PRECIP_CONDITIONS.includes(condition),
+    windMph,
+    windGustMph,
+    isWindy: windMph >= WIND_MPH_THRESHOLD || windGustMph >= GUST_MPH_THRESHOLD,
+    humidity: inst.relative_humidity ?? 0,
+    isDay,
+    weatherCode: -1,
+    condition,
+  };
+}
+
+export async function fetchWeather(): Promise<WeatherSnapshot> {
+  const { latitude, longitude } = await getCoords();
+
+  // Open-Meteo is primary (richer data). Retry once, then fall back to MET
+  // Norway so a flaky api.open-meteo.com can't take the whole app down.
+  let core: WeatherCore | null = null;
+  for (let attempt = 0; attempt < 2 && !core; attempt += 1) {
+    try {
+      core = await fetchFromOpenMeteo(latitude, longitude);
+    } catch {
+      // try again / fall through to the backup
+    }
+  }
+  if (!core) {
+    try {
+      core = await fetchFromMet(latitude, longitude);
+    } catch {
+      // both providers down
+    }
+  }
+  if (!core) {
+    throw new Error(
+      'Weather service ghosted us. Check your connection and try again.'
+    );
+  }
+
+  const city = await reverseCity(latitude, longitude);
+  return { ...core, city, fetchedAt: Date.now() };
 }
