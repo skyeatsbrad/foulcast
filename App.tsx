@@ -230,17 +230,18 @@ export default function App() {
           <Text style={styles.wordmark}>FOULCAST</Text>
         </View>
 
+        <Text style={styles.hint}>tap for another take · pull to refresh</Text>
+
         <Pressable
           onPress={handleShare}
+          hitSlop={14}
           style={({ pressed }) => [
             styles.shareBtn,
             pressed && styles.buttonPressed,
           ]}
         >
-          <Text style={styles.shareBtnText}>Share</Text>
+          <Text style={styles.shareBtnText}>share</Text>
         </Pressable>
-
-        <Text style={styles.hint}>tap for another take · pull to refresh</Text>
       </View>
     );
   }
@@ -355,19 +356,15 @@ const styles = StyleSheet.create({
     marginTop: 30,
   },
   shareBtn: {
-    borderWidth: 1,
-    borderColor: COLORS.chipBorder,
-    backgroundColor: COLORS.chipBg,
-    borderRadius: 999,
-    paddingHorizontal: 26,
-    paddingVertical: 11,
-    marginTop: 24,
+    marginTop: 12,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
   },
   shareBtnText: {
-    fontFamily: 'Inter_600SemiBold',
-    color: COLORS.text,
-    fontSize: 15,
-    letterSpacing: 0.3,
+    fontFamily: 'Inter_500Medium',
+    color: COLORS.faint,
+    fontSize: 12,
+    letterSpacing: 2,
   },
   stateBig: {
     fontFamily: 'Inter_700Bold',
