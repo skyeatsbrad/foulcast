@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Linking,
   Pressable,
   RefreshControl,
@@ -48,9 +49,10 @@ const PRECIP_META: Record<Condition, { icon: string; word: string }> = {
 
 function precipLabel(w: WeatherSnapshot): string {
   const meta = PRECIP_META[w.condition];
+  const icon = meta.icon || '🌧';
   const word = meta.word || 'precip';
   const amount = w.precipInch >= 0.01 ? `${w.precipInch.toFixed(2)}" ` : '';
-  return `${meta.icon} ${amount}${word}`.trim();
+  return `${icon} ${amount}${word}`.trim();
 }
 
 function windLabel(w: WeatherSnapshot): string {
@@ -106,6 +108,8 @@ function Button({
   return (
     <Pressable
       onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={label}
       style={({ pressed }) => [
         styles.button,
         ghost && styles.buttonGhost,
@@ -120,7 +124,7 @@ function Button({
 }
 
 export default function App() {
-  const [fontsLoaded] = useFonts({
+  const [fontsLoaded, fontError] = useFonts({
     Inter_200ExtraLight,
     Inter_400Regular,
     Inter_500Medium,
@@ -130,11 +134,11 @@ export default function App() {
 
   const { status, data, errorMessage, refreshing, refresh } = useWeather();
 
-  // A fresh quip per fetch; tapping the quip rerolls without refetching.
-  const [quipSeed, setQuipSeed] = useState(0);
+  // A fresh quip per fetch; the 69° easter egg is driven by the pull gesture
+  // (see onPull) so it never needs a network round-trip.
   const [quip, setQuip] = useState('');
-  // 69° is Nice. Keep pulling for another and it escalates: I SAID NICE ->
-  // spicy -> nah fam -> Nice (no/nope/no way jose...). Resets when temp leaves 69.
+  // 69° is Nice. Keep pulling and it escalates: I SAID NICE -> spicy -> nah fam
+  // -> Nice (no/nope/no way jose...). Resets when the temp leaves 69.
   const niceStreak = useRef(0);
   useEffect(() => {
     if (!data) {
@@ -142,31 +146,51 @@ export default function App() {
       return;
     }
     if (Math.round(data.tempF) === 69) {
-      niceStreak.current += 1;
+      // Seed the first "Nice."; pulls advance the rung, refetches keep it.
+      if (niceStreak.current === 0) niceStreak.current = 1;
       setQuip(niceQuip(niceStreak.current));
     } else {
       niceStreak.current = 0;
       setQuip(pickQuip(data));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.fetchedAt, quipSeed]);
+  }, [data?.fetchedAt]);
+
+  const isNice = !!data && Math.round(data.tempF) === 69;
+
+  // Pull-to-refresh: at 69° every pull escalates the refusal on the spot (no
+  // network hit); otherwise it's a normal throttled refresh.
+  const onPull = () => {
+    if (isNice) {
+      niceStreak.current += 1;
+      setQuip(niceQuip(niceStreak.current));
+    }
+    refresh();
+  };
+
+  // Tap the quip for another take — but at 69° Foulcast refuses to budge.
+  const onTapQuip = () => {
+    if (data && !isNice) setQuip(pickQuip(data));
+  };
 
   const shotRef = useRef<View>(null);
   const handleShare = async () => {
     try {
-      const uri = await captureRef(shotRef, { format: 'png', quality: 1 });
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(uri, {
-          mimeType: 'image/png',
-          dialogTitle: 'Share your Foulcast',
-        });
+      if (!(await Sharing.isAvailableAsync())) {
+        Alert.alert('Sharing unavailable', "This device can't share right now.");
+        return;
       }
+      const uri = await captureRef(shotRef, { format: 'png', quality: 1 });
+      await Sharing.shareAsync(uri, {
+        mimeType: 'image/png',
+        dialogTitle: 'Share your Foulcast',
+      });
     } catch {
-      // Sharing is best-effort; ignore cancellations and failures.
+      // Best-effort: ignore user cancellations and transient capture failures.
     }
   };
 
-  if (!fontsLoaded) {
+  if (!fontsLoaded && !fontError) {
     return <View style={styles.root} />;
   }
 
@@ -209,14 +233,25 @@ export default function App() {
             <Text style={styles.city}>{data.city.toUpperCase()}</Text>
           ) : null}
 
-          <Text style={styles.temp}>{Math.round(data.tempF)}°</Text>
+          <Text
+            style={styles.temp}
+            accessibilityLabel={`${Math.round(data.tempF)} degrees`}
+          >
+            {Math.round(data.tempF)}°
+          </Text>
           <Text style={styles.feels}>
             feels like {Math.round(data.feelsLikeF)}°
           </Text>
 
           <View style={styles.rule} />
 
-          <Pressable onPress={() => setQuipSeed((s) => s + 1)} hitSlop={16}>
+          <Pressable
+            onPress={onTapQuip}
+            hitSlop={16}
+            accessibilityRole="button"
+            accessibilityLabel="Another take"
+            accessibilityHint="Shows a different weather quip"
+          >
             <Text style={styles.quip}>{quip}</Text>
           </Pressable>
 
@@ -235,6 +270,8 @@ export default function App() {
         <Pressable
           onPress={handleShare}
           hitSlop={14}
+          accessibilityRole="button"
+          accessibilityLabel="Share your Foulcast"
           style={({ pressed }) => [
             styles.shareBtn,
             pressed && styles.buttonPressed,
@@ -254,7 +291,7 @@ export default function App() {
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
-            onRefresh={refresh}
+            onRefresh={onPull}
             tintColor={COLORS.text}
             colors={[COLORS.text]}
           />

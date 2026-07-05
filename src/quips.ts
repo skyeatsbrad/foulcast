@@ -32,7 +32,7 @@ const NIGHT_BLEND = 0.32;
 
 // Chooses the base pool from weather then temperature. Dramatic weather beats
 // temperature; extreme temperatures beat wind; wind beats a merely mild day.
-function selectPool(w: WeatherSnapshot): Pool {
+export function selectPool(w: WeatherSnapshot): Pool {
   switch (w.condition) {
     case 'thunderstorm':
       return STORM;

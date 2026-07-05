@@ -83,7 +83,7 @@ const wait = (ms: number): Promise<void> =>
 // Resolves with the first promise to fulfill; only rejects once every promise
 // has rejected. Lets us race weather providers so one dead host can't stall the
 // whole refresh — whoever answers first wins.
-function firstSuccess<T>(promises: Promise<T>[]): Promise<T> {
+export function firstSuccess<T>(promises: Promise<T>[]): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let remaining = promises.length;
     let done = false;
@@ -119,9 +119,14 @@ async function getCoords(): Promise<{ latitude: number; longitude: number }> {
     throw new LocationPermissionError();
   }
 
-  // A cached fix is instant and sidesteps the slow (sometimes never-ending)
-  // fresh GPS lock, so use it whenever one exists.
-  const last = await Location.getLastKnownPositionAsync().catch(() => null);
+  // A recent cached fix is instant and sidesteps the slow (sometimes
+  // never-ending) fresh GPS lock. Bound it by age and accuracy so we never
+  // show weather for a city you left days ago; a stale/imprecise fix falls
+  // through to a fresh reading below.
+  const last = await Location.getLastKnownPositionAsync({
+    maxAge: 10 * 60 * 1000,
+    requiredAccuracy: 5000,
+  }).catch(() => null);
   if (last) {
     return { latitude: last.coords.latitude, longitude: last.coords.longitude };
   }
@@ -164,19 +169,29 @@ type WeatherCore = Omit<WeatherSnapshot, 'city' | 'fetchedAt'>;
 
 const MS_TO_MPH = 2.2369362920544;
 // MET Norway rejects requests without an identifying User-Agent.
-const MET_USER_AGENT = 'Foulcast/1.1.4 (github.com/skyeatsbrad/foulcast)';
+const MET_USER_AGENT = 'Foulcast/1.1.5 (github.com/skyeatsbrad/foulcast)';
 
 async function fetchWithTimeout(
   url: string,
   init: { headers?: Record<string, string> },
-  ms: number
+  ms: number,
+  externalSignal?: AbortSignal
 ): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), ms);
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -193,7 +208,8 @@ interface OpenMeteoCurrent {
 
 async function fetchFromOpenMeteo(
   latitude: number,
-  longitude: number
+  longitude: number,
+  signal?: AbortSignal
 ): Promise<WeatherCore> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}` +
@@ -202,7 +218,7 @@ async function fetchFromOpenMeteo(
     '&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch' +
     '&timezone=auto';
 
-  const res = await fetchWithTimeout(url, {}, 15000);
+  const res = await fetchWithTimeout(url, {}, 10000, signal);
   if (!res.ok) {
     throw new Error(`Weather service coughed up a ${res.status}.`);
   }
@@ -235,7 +251,7 @@ async function fetchFromOpenMeteo(
 }
 
 // MET Norway symbol_code (e.g. "clearsky_night", "lightrain", "snow") -> Condition.
-function metSymbolToCondition(symbol: string): Condition {
+export function metSymbolToCondition(symbol: string): Condition {
   const s = symbol.toLowerCase();
   if (s.includes('thunder')) return 'thunderstorm';
   if (s.includes('sleet')) return 'freezing';
@@ -269,7 +285,8 @@ interface MetTimeseries {
 // when present, otherwise a rough local-hour guess (good enough for a backup).
 async function fetchFromMet(
   latitude: number,
-  longitude: number
+  longitude: number,
+  signal?: AbortSignal
 ): Promise<WeatherCore> {
   const url =
     'https://api.met.no/weatherapi/locationforecast/2.0/compact' +
@@ -277,7 +294,8 @@ async function fetchFromMet(
   const res = await fetchWithTimeout(
     url,
     { headers: { 'User-Agent': MET_USER_AGENT } },
-    15000
+    10000,
+    signal
   );
   if (!res.ok) {
     throw new Error(`Backup weather service coughed up a ${res.status}.`);
@@ -338,13 +356,20 @@ export async function fetchWeather(): Promise<WeatherSnapshot> {
   // outer timeout is a hard cap so a fetch that ignores its abort signal can
   // never leave the refresh spinning. When api.open-meteo.com is down, MET
   // resolves in ~1.5s instead of the app hanging on ~30s of timeouts.
+  const omController = new AbortController();
+  const metController = new AbortController();
+
   const openMeteo = withTimeout(
-    fetchFromOpenMeteo(latitude, longitude),
-    10000,
+    fetchFromOpenMeteo(latitude, longitude, omController.signal),
+    11000,
     'Open-Meteo timed out.'
   );
   const met = wait(600).then(() =>
-    withTimeout(fetchFromMet(latitude, longitude), 10000, 'MET timed out.')
+    withTimeout(
+      fetchFromMet(latitude, longitude, metController.signal),
+      11000,
+      'MET timed out.'
+    )
   );
 
   let core: WeatherCore | null = null;
@@ -353,6 +378,11 @@ export async function fetchWeather(): Promise<WeatherSnapshot> {
   } catch {
     // Both providers are down.
     core = null;
+  } finally {
+    // Cancel whichever provider didn't win so we're not still hitting the
+    // loser in the background — chiefly MET when Open-Meteo already answered.
+    omController.abort();
+    metController.abort();
   }
   if (!core) {
     throw new Error(
